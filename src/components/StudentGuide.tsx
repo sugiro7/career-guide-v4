@@ -22,12 +22,42 @@ const BADGE_COLORS: Record<string, string> = {
 const CURVE_COLORS = ['#378ADD','#1D9E75','#BA7517','#534AB7','#E24B4A','#0F6E56','#3B6D11','#993556'];
 
 type SortKey = 'salary' | 'overtime' | 'holiday' | 'paid';
+type CurveType = 'salary' | 'disposable_income' | 'disposable_time';
+
+// 可処分所得の計算定数
+// 手取り率：年収帯に応じた実効税率・社会保険料を考慮した近似値
+const takeHomeRate = (salaryMan: number): number => {
+  if (salaryMan < 400) return 0.82;
+  if (salaryMan < 600) return 0.78;
+  if (salaryMan < 800) return 0.75;
+  if (salaryMan < 1200) return 0.72;
+  return 0.68; // 高所得帯は税負担増
+};
+
+// 可処分時間の計算定数
+const WORK_DAYS_PER_MONTH = 22;
+const COMMUTE_HOURS = 1.0;
+const SLEEP_HOURS = 7;
+const TOTAL_HOURS_PER_MONTH = 30 * 24;
+
+// 所定労働時間の選択肢（時間, 表示ラベル）
+const WORK_HOURS_OPTIONS = [
+  { value: 7.0,        label: '7時間00分' },
+  { value: 7 + 10/60,  label: '7時間10分' },
+  { value: 7.5,        label: '7時間30分（標準）' },
+  { value: 7 + 45/60,  label: '7時間45分' },
+  { value: 8.0,        label: '8時間00分' },
+] as const;
 
 export default function StudentGuide({ onBack }: { onBack: () => void }) {
   const [tab, setTab] = useState('overview');
   const [selected, setSelected] = useState<Industry | null>(null);
   const [sort, setSort] = useState<SortKey>('salary');
-  const [selectedCurve, setSelectedCurve] = useState<string[]>(['shosha', 'manufacturer', 'it', 'infra']);
+  const [selectedCurve, setSelectedCurve] = useState<string[]>(
+    industries.map(ind => ind.key) // 全業界をデフォルトで選択
+  );
+  const [curveType, setCurveType] = useState<CurveType>('salary');
+  const [workHoursPerDay, setWorkHoursPerDay] = useState<number>(7.5);
   const [quiz, setQuiz] = useState({ salary: 3, wlb: 3, holiday: 3, stable: 3, growth: 3, global: 3 });
 
   const sorted = [...industries].sort((a, b) => {
@@ -38,13 +68,52 @@ export default function StudentGuide({ onBack }: { onBack: () => void }) {
     return 0;
   });
 
-  const curveData = SALARY_AGES.map((age, i) => {
+  // 年収カーブ（万円/年）
+  const curveDataSalary = SALARY_AGES.map((age, i) => {
     const obj: Record<string, number | string> = { age: `${age}歳` };
     industries.filter(ind => selectedCurve.includes(ind.key)).forEach(ind => {
       obj[ind.name] = ind.salaryCurve[i];
     });
     return obj;
   });
+
+  // 可処分所得カーブ（万円/月）= 年収 × 手取り率 ÷ 12
+  const curveDataDisposableIncome = SALARY_AGES.map((age, i) => {
+    const obj: Record<string, number | string> = { age: `${age}歳` };
+    industries.filter(ind => selectedCurve.includes(ind.key)).forEach(ind => {
+      const annualSalary = ind.salaryCurve[i];
+      const monthly = Math.round(annualSalary * takeHomeRate(annualSalary) / 12);
+      obj[ind.name] = monthly;
+    });
+    return obj;
+  });
+
+  // 可処分時間カーブ（時間/月）= 総時間 - 実働時間 - 通勤 - 睡眠
+  // 残業時間は年齢が上がるにつれ変化すると仮定（若手は少し多め、40代以降は役職で増減）
+  const overtimeByAge = (baseOvertime: number, ageIndex: number): number => {
+    const factors = [0.8, 1.0, 1.1, 1.1, 1.05, 1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7];
+    return Math.round(baseOvertime * (factors[ageIndex] ?? 1.0));
+  };
+
+  const curveDataDisposableTime = SALARY_AGES.map((age, i) => {
+    const obj: Record<string, number | string> = { age: `${age}歳` };
+    industries.filter(ind => selectedCurve.includes(ind.key)).forEach(ind => {
+      const ot = overtimeByAge(ind.overtime, i);
+      const workH = workHoursPerDay * WORK_DAYS_PER_MONTH + ot;
+      const commuteH = COMMUTE_HOURS * WORK_DAYS_PER_MONTH;
+      const sleepH = SLEEP_HOURS * 30;
+      const free = Math.max(0, Math.round(TOTAL_HOURS_PER_MONTH - workH - commuteH - sleepH));
+      obj[ind.name] = free;
+    });
+    return obj;
+  });
+
+  // 現在選択中のグラフデータ
+  const curveData = curveType === 'salary'
+    ? curveDataSalary
+    : curveType === 'disposable_income'
+    ? curveDataDisposableIncome
+    : curveDataDisposableTime;
 
   const quizResults = [...industries].map(i => ({
     ...i,
@@ -239,8 +308,24 @@ export default function StudentGuide({ onBack }: { onBack: () => void }) {
         {/* ── CURVE ── */}
         {tab === 'curve' && (
           <div>
+            {/* グラフ種別切り替え */}
+            <div className="flex gap-2 mb-4 flex-wrap">
+              {([
+                ['salary',           '💰 年収カーブ',     '年間収入（額面）'],
+                ['disposable_income','💳 可処分所得カーブ','手取り月収の推移'],
+                ['disposable_time',  '⏰ 可処分時間カーブ','自由時間の推移'],
+              ] as const).map(([key, label, sub]) => (
+                <button key={key} onClick={() => setCurveType(key)}
+                  className={`flex flex-col items-start px-4 py-2 rounded-xl text-left border transition-colors ${curveType === key ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400'}`}>
+                  <span className="text-xs font-medium">{label}</span>
+                  <span className={`text-xs ${curveType === key ? 'text-gray-300' : 'text-gray-400'}`}>{sub}</span>
+                </button>
+              ))}
+            </div>
+
+            {/* 業界選択 */}
             <div className="mb-4">
-              <p className="text-sm text-gray-600 mb-3">比較する業界を選択（複数選択可）：</p>
+              <p className="text-xs text-gray-500 mb-2">比較する業界を選択（複数選択可）：</p>
               <div className="flex flex-wrap gap-2">
                 {industries.map((ind, i) => (
                   <button key={ind.key}
@@ -255,40 +340,139 @@ export default function StudentGuide({ onBack }: { onBack: () => void }) {
               </div>
             </div>
 
-            <div className="bg-white border border-gray-200 rounded-xl p-4">
-              <h2 className="text-sm font-medium text-gray-900 mb-4">業界別 年収カーブ（大手企業・総合職モデル）</h2>
+            {/* 所定労働時間セレクター（可処分時間グラフのときのみ表示） */}
+            {curveType === 'disposable_time' && (
+              <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 mb-4">
+                <p className="text-xs font-medium text-gray-700 mb-2">
+                  ⚙ 所定労働時間を選択
+                  <span className="ml-2 text-gray-400 font-normal">計算基準として使用します</span>
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {WORK_HOURS_OPTIONS.map(opt => (
+                    <button key={opt.value} onClick={() => setWorkHoursPerDay(opt.value)}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${workHoursPerDay === opt.value ? 'bg-gray-900 text-white border-gray-900' : 'bg-white text-gray-600 border-gray-200 hover:border-gray-400'}`}>
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* グラフ本体 */}
+            <div className="bg-white border border-gray-200 rounded-xl p-4 mb-4">
+              {curveType === 'salary' && (
+                <h2 className="text-sm font-medium text-gray-900 mb-1">業界別 年収カーブ（大手・総合職モデル）</h2>
+              )}
+              {curveType === 'disposable_income' && (
+                <div className="mb-1">
+                  <h2 className="text-sm font-medium text-gray-900">業界別 可処分所得カーブ（手取り月収）</h2>
+                  <p className="text-xs text-gray-400">年収 × 手取り率（所得税・社保考慮）÷ 12ヶ月で算出</p>
+                </div>
+              )}
+              {curveType === 'disposable_time' && (
+                <div className="mb-1">
+                  <h2 className="text-sm font-medium text-gray-900">業界別 可処分時間カーブ（自由時間/月）</h2>
+                  <p className="text-xs text-gray-400">
+                    月720h − 実働時間（所定{WORK_HOURS_OPTIONS.find(o => o.value === workHoursPerDay)?.label ?? `${workHoursPerDay}h`}×22日＋残業）− 通勤1h×22日 − 睡眠7h×30日
+                  </p>
+                </div>
+              )}
+
               <ResponsiveContainer width="100%" height={320}>
-                <LineChart data={curveData} margin={{ top: 5, right: 20, bottom: 5, left: 10 }}>
+                <LineChart data={curveData} margin={{ top: 10, right: 20, bottom: 5, left: 10 }}>
                   <XAxis dataKey="age" tick={{ fontSize: 11 }} />
-                  <YAxis tickFormatter={v => `${v}万`} tick={{ fontSize: 11 }} domain={[300, 2500]} />
-                  <Tooltip formatter={(v: number) => [`${v}万円`]} />
+                  <YAxis tick={{ fontSize: 11 }}
+                    tickFormatter={v =>
+                      curveType === 'salary' ? `${v}万` :
+                      curveType === 'disposable_income' ? `${v}万` :
+                      `${v}h`
+                    }
+                    domain={
+                      curveType === 'salary' ? [300, 2500] :
+                      curveType === 'disposable_income' ? [15, 130] :
+                      [100, 300]
+                    }
+                  />
+                  <Tooltip
+                    formatter={(v: number, name: string) => [
+                      curveType === 'salary' ? `${v}万円/年` :
+                      curveType === 'disposable_income' ? `${v}万円/月` :
+                      `${v}時間/月`,
+                      name
+                    ]}
+                  />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
-                  {industries.filter(ind => selectedCurve.includes(ind.key)).map((ind, i) => (
+                  {industries.filter(ind => selectedCurve.includes(ind.key)).map(ind => (
                     <Line key={ind.key} type="monotone" dataKey={ind.name}
                       stroke={CURVE_COLORS[industries.indexOf(ind) % CURVE_COLORS.length]}
                       strokeWidth={2} dot={{ r: 3 }} />
                   ))}
                 </LineChart>
               </ResponsiveContainer>
-              <p className="text-xs text-gray-400 mt-3">
-                ※OpenWork口コミ・各社有価証券報告書・各種調査をもとにした推計モデル。実際は個人差・会社差・年度により大きく異なります。
+
+              <p className="text-xs text-gray-400 mt-2">
+                ※推計モデルのため、実際は個人差・会社差・年度により大きく異なります。
               </p>
             </div>
 
-            {/* Curve insights */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-4">
-              {[
-                { emoji: '🌏', title: '総合商社', body: '22歳：400万→25歳：600万→30歳：1,000万。ボーナスが大きく伸び、30歳前後で一気に上がる。海外駐在でさらに1.5倍。' },
-                { emoji: '💼', title: 'コンサル', body: '昇進ペースが速く、Up or Outで20代でも年収が大きく変わる。外資戦略系は30代で2,000万超も。' },
-                { emoji: '🏭', title: '製造業（大手）', body: '22歳：390万→30歳：680万→40歳：880万と安定して右肩上がり。上限は商社・コンサルより低め。' },
-                { emoji: '⚡', title: 'インフラ', body: '急な上昇はないが、安定した年功序列カーブ。50歳近くでも着実に増え続ける。倒産リスクゼロ。' },
-              ].map(item => (
-                <div key={item.title} className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-sm font-medium text-gray-800 mb-1">{item.emoji} {item.title}</p>
-                  <p className="text-xs text-gray-600 leading-relaxed">{item.body}</p>
+            {/* インサイトカード：選択中の業界を動的に表示 */}
+            {(() => {
+              const selected = industries.filter(ind => selectedCurve.includes(ind.key));
+              if (selected.length === 0) return (
+                <p className="text-xs text-gray-400 text-center py-4">業界を1つ以上選択してください</p>
+              );
+
+              return (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {selected.map((ind, i) => {
+                    // グラフ種別ごとに表示する数値を切り替え
+                    let summary = '';
+                    if (curveType === 'salary') {
+                      const s22 = ind.salaryCurve[0];
+                      const s30 = ind.salaryCurve[3];
+                      const s40 = ind.salaryCurve[7];
+                      summary = `22歳：${s22}万 → 30歳：${s30}万 → 40歳：${s40}万円`;
+                    } else if (curveType === 'disposable_income') {
+                      const toHand = (sal: number) => Math.round(sal * takeHomeRate(sal) / 12);
+                      const h22 = toHand(ind.salaryCurve[0]);
+                      const h30 = toHand(ind.salaryCurve[3]);
+                      const h40 = toHand(ind.salaryCurve[7]);
+                      summary = `22歳：${h22}万/月 → 30歳：${h30}万/月 → 40歳：${h40}万/月`;
+                    } else {
+                      const toFree = (ageIdx: number) => {
+                        const ot = overtimeByAge(ind.overtime, ageIdx);
+                        const workH = workHoursPerDay * WORK_DAYS_PER_MONTH + ot;
+                        return Math.max(0, Math.round(TOTAL_HOURS_PER_MONTH - workH - COMMUTE_HOURS * WORK_DAYS_PER_MONTH - SLEEP_HOURS * 30));
+                      };
+                      const f22 = toFree(0);
+                      const f30 = toFree(3);
+                      const f40 = toFree(7);
+                      summary = `22歳：${f22}h/月 → 30歳：${f30}h/月 → 40歳：${f40}h/月`;
+                    }
+
+                    return (
+                      <div key={ind.key} className="bg-white border border-gray-200 rounded-xl p-3"
+                        style={{ borderLeftWidth: 3, borderLeftColor: CURVE_COLORS[industries.indexOf(ind) % CURVE_COLORS.length] }}>
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-base">{ind.icon}</span>
+                          <span className="text-sm font-medium text-gray-900">{ind.name}</span>
+                          <span className={`ml-auto text-xs px-2 py-0.5 rounded-full ${
+                            ind.badge === 'bb' ? 'bg-blue-50 text-blue-700' :
+                            ind.badge === 'bg' ? 'bg-green-50 text-green-700' :
+                            ind.badge === 'br' ? 'bg-red-50 text-red-700' :
+                            'bg-amber-50 text-amber-700'
+                          }`}>{ind.badgeText}</span>
+                        </div>
+                        <p className="text-xs text-gray-500 mb-1.5">{ind.tagline}</p>
+                        <p className="text-xs font-medium text-gray-700 bg-gray-50 rounded-lg px-2 py-1.5 tabular-nums">
+                          {summary}
+                        </p>
+                      </div>
+                    );
+                  })}
                 </div>
-              ))}
-            </div>
+              );
+            })()}
           </div>
         )}
 
